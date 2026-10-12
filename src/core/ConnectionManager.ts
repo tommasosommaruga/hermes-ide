@@ -27,6 +27,7 @@ export class ConnectionManager {
 
   constructor(
     private readonly sessionUpdateHandler: SessionUpdateHandler,
+    private readonly permissionHandler: PermissionHandler,
   ) {}
 
   /**
@@ -49,10 +50,10 @@ export class ConnectionManager {
     // Wrap the stream to intercept and log all ACP traffic
     const tappedStream = this.tapStream(stream);
 
-    // Create handlers
+    // Create handlers (shared PermissionHandler keeps in-chat approvals)
     const fsHandler = new FileSystemHandler();
     const terminalHandler = new TerminalHandler();
-    const permissionHandler = new PermissionHandler();
+    const permissionHandler = this.permissionHandler;
 
     // Create client implementation
     const client = new AcpClientImpl(

@@ -11,7 +11,7 @@ Adapted fork of [formulahendry/vscode-acp](https://github.com/formulahendry/vsco
 - No remote agent registry
 - No npx / `@latest` launchers
 - Direct spawn with `shell: false`
-- Permissions always ask (dismiss → deny)
+- **v0.2:** live tool activity in chat (commands, paths, status) + Cursor-like in-chat approval cards with Allow once / Allow for session / Allow always / Reject
 - Client fs/terminal capabilities not advertised
 - Traffic logging off by default
 

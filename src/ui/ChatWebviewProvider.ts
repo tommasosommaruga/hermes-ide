@@ -2,7 +2,8 @@ import * as vscode from 'vscode';
 import { marked } from 'marked';
 import { SessionManager } from '../core/SessionManager';
 import { SessionUpdateHandler, SessionUpdateListener } from '../handlers/SessionUpdateHandler';
-import type { SessionNotification } from '@agentclientprotocol/sdk';
+import type { PermissionUiRequest } from '../handlers/PermissionHandler';
+import type { RequestPermissionResponse, SessionNotification } from '@agentclientprotocol/sdk';
 import { logError } from '../utils/Logger';
 import { sendEvent } from '../utils/TelemetryManager';
 
@@ -16,6 +17,10 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private updateListener: SessionUpdateListener;
   private _hasChatContent = false;
+  private pendingPermissions = new Map<
+    string,
+    { resolve: (value: RequestPermissionResponse) => void }
+  >();
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -108,6 +113,22 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
             html: this.renderMarkdown(item.text),
           }));
           this.postMessage({ type: 'markdownRendered', items: rendered });
+          break;
+        }
+        case 'permissionResponse': {
+          const requestId = String(message.requestId || '');
+          const pending = this.pendingPermissions.get(requestId);
+          if (!pending) {
+            break;
+          }
+          this.pendingPermissions.delete(requestId);
+          if (message.cancelled || !message.optionId) {
+            pending.resolve({ outcome: { outcome: 'cancelled' } });
+          } else {
+            pending.resolve({
+              outcome: { outcome: 'selected', optionId: String(message.optionId) },
+            });
+          }
           break;
         }
       }
@@ -626,16 +647,48 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     .turn-tools-list { }
     .turn-tools-list.collapsed { display: none; }
 
-    /* Compact inline tool call */
+    /* Live activity strip */
+    .activity-banner {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      margin: 0 0 8px;
+      border-radius: 6px;
+      background: var(--vscode-editorWidget-background);
+      border: 1px solid var(--vscode-panel-border);
+      font-size: 0.85em;
+      opacity: 0.95;
+    }
+    .activity-banner.visible { display: flex; }
+    .activity-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--vscode-progressBar-background);
+      animation: thoughtPulse 1.2s ease-in-out infinite;
+      flex-shrink: 0;
+    }
+    .activity-banner.waiting .activity-dot {
+      background: var(--vscode-charts-orange, #cc7a00);
+    }
+
+    /* Compact inline tool call — expandable details */
     .tool-call-inline {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 6px 8px;
+      font-size: 0.85em;
+      border-radius: 6px;
+      background: var(--vscode-editorWidget-background);
+      border: 1px solid var(--vscode-panel-border);
+      opacity: 0.95;
+    }
+    .tool-call-inline .tc-row {
       display: flex;
       align-items: center;
       gap: 6px;
-      padding: 3px 6px;
-      font-size: 0.85em;
-      border-radius: 4px;
-      background: var(--vscode-editorWidget-background);
-      opacity: 0.85;
     }
     .tool-call-inline .tc-icon {
       flex-shrink: 0;
@@ -651,6 +704,134 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      font-weight: 600;
+    }
+    .tool-call-inline .tc-kind {
+      font-size: 0.75em;
+      opacity: 0.7;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .tool-call-inline .tc-details {
+      margin: 0;
+      padding: 6px 8px;
+      border-radius: 4px;
+      background: var(--vscode-textCodeBlock-background, rgba(127,127,127,0.12));
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 0.8em;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 180px;
+      overflow-y: auto;
+    }
+    .tool-call-inline .tc-details:empty { display: none; }
+
+    /* Permission card — Cursor-like approval */
+    .permission-card {
+      align-self: stretch;
+      margin: 8px 0;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid var(--vscode-focusBorder, var(--vscode-panel-border));
+      background: var(--vscode-editorWidget-background);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .permission-card.resolved {
+      opacity: 0.65;
+      border-color: var(--vscode-panel-border);
+    }
+    .permission-card .perm-eyebrow {
+      font-size: 0.75em;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      opacity: 0.7;
+      font-weight: 600;
+    }
+    .permission-card .perm-title {
+      font-size: 1em;
+      font-weight: 650;
+      line-height: 1.35;
+    }
+    .permission-card .perm-summary {
+      font-size: 0.9em;
+      line-height: 1.4;
+    }
+    .permission-card .perm-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .permission-card .perm-chip {
+      font-size: 0.75em;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
+    }
+    .permission-card .perm-details {
+      margin: 0;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: var(--vscode-textCodeBlock-background, rgba(127,127,127,0.12));
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 0.82em;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+    .permission-card .perm-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .permission-card .perm-btn {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 2px;
+      width: 100%;
+      text-align: left;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--vscode-button-border, transparent);
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .permission-card .perm-btn .perm-btn-label {
+      font-weight: 600;
+      font-size: 0.9em;
+    }
+    .permission-card .perm-btn .perm-btn-desc {
+      font-size: 0.78em;
+      opacity: 0.8;
+      line-height: 1.35;
+    }
+    .permission-card .perm-btn.allow {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+    }
+    .permission-card .perm-btn.allow:hover {
+      background: var(--vscode-button-hoverBackground);
+    }
+    .permission-card .perm-btn.danger {
+      background: transparent;
+      color: var(--vscode-errorForeground);
+      border-color: var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground));
+    }
+    .permission-card .perm-btn.reject {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+    }
+    .permission-card .perm-btn:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+    .permission-card .perm-result {
+      font-size: 0.85em;
+      opacity: 0.85;
     }
 
     /* Legacy standalone tool-call card (for history restore) */
@@ -1133,6 +1314,10 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     <span class="status" id="status"></span>
   </div>
 
+  <div class="activity-banner" id="activityBanner" aria-live="polite">
+    <span class="activity-dot"></span>
+    <span id="activityText">Working…</span>
+  </div>
   <div class="messages" id="messages">
     <div class="empty-state" id="emptyState">
       <div class="icon">🤖</div>
@@ -1211,6 +1396,20 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     const inputArea = document.getElementById('inputArea');
     const resizeHandle = document.getElementById('resizeHandle');
     const slashPopup = document.getElementById('slashPopup');
+    const activityBanner = document.getElementById('activityBanner');
+    const activityText = document.getElementById('activityText');
+
+    function setActivity(text, waiting) {
+      if (!activityBanner || !activityText) return;
+      if (!text) {
+        activityBanner.classList.remove('visible', 'waiting');
+        activityText.textContent = '';
+        return;
+      }
+      activityText.textContent = text;
+      activityBanner.classList.add('visible');
+      activityBanner.classList.toggle('waiting', !!waiting);
+    }
 
     // Picker elements
     const modePickerWrap = document.getElementById('modePickerWrap');
@@ -2012,29 +2211,79 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    function addToolCall(toolCallId, title, status) {
-      chatHistory.push({ kind: 'toolCall', toolCallId, title, status });
-      saveState();
-      addToolCallInline(toolCallId, title, status);
+    function formatToolDetails(tc) {
+      const lines = [];
+      if (!tc) return '';
+      const kind = tc.kind || '';
+      const raw = tc.rawInput || {};
+      if (raw.command) lines.push('$ ' + String(raw.command));
+      else if (raw.cmd) lines.push('$ ' + String(raw.cmd));
+      if (raw.path) lines.push('path: ' + String(raw.path));
+      if (raw.description) lines.push(String(raw.description));
+      if (Array.isArray(tc.locations)) {
+        for (const loc of tc.locations) {
+          if (loc && loc.path) lines.push('file: ' + loc.path);
+        }
+      }
+      if (Array.isArray(tc.content)) {
+        for (const block of tc.content) {
+          if (!block) continue;
+          if (block.type === 'diff' && block.path) {
+            lines.push('diff: ' + block.path);
+          } else if (block.type === 'content' && block.content && block.content.type === 'text') {
+            const t = String(block.content.text || '').trim();
+            if (t) lines.push(t.length > 800 ? t.slice(0, 800) + '…' : t);
+          } else if (block.type === 'text' && block.text) {
+            const t = String(block.text).trim();
+            if (t) lines.push(t.length > 800 ? t.slice(0, 800) + '…' : t);
+          }
+        }
+      }
+      if (tc.rawOutput != null) {
+        const out = typeof tc.rawOutput === 'string' ? tc.rawOutput : JSON.stringify(tc.rawOutput, null, 2);
+        if (out && out !== '{}') {
+          lines.push('--- output ---');
+          lines.push(out.length > 1200 ? out.slice(0, 1200) + '…' : out);
+        }
+      }
+      if (!lines.length && kind) lines.push('kind: ' + kind);
+      return lines.join('\\n');
     }
 
-    function addToolCallInline(toolCallId, title, status) {
+    function addToolCall(toolCallId, title, status, extra) {
+      chatHistory.push({ kind: 'toolCall', toolCallId, title, status, extra: extra || null });
+      saveState();
+      addToolCallInline(toolCallId, title, status, extra);
+    }
+
+    function addToolCallInline(toolCallId, title, status, extra) {
       hideEmpty();
       ensureTurnTools();
+      // Keep tool list expanded so activity is always visible
+      if (currentToolsListEl) currentToolsListEl.classList.remove('collapsed');
       currentToolCount++;
       if (currentToolsCountEl) {
         currentToolsCountEl.dataset.count = String(currentToolCount);
         currentToolsCountEl.textContent = '▾ ' + currentToolCount + ' tool call' + (currentToolCount !== 1 ? 's' : '');
       }
 
+      const details = formatToolDetails(extra);
+      const kind = (extra && extra.kind) ? String(extra.kind) : '';
       const el = document.createElement('div');
       el.className = 'tool-call-inline';
       el.id = 'tc-' + toolCallId;
       el.innerHTML =
-        '<span class="tc-icon ' + status + '">' + getStatusIcon(status) + '</span>' +
-        '<span class="tc-title">' + escapeHtml(title || 'Tool Call') + '</span>';
+        '<div class="tc-row">' +
+          '<span class="tc-icon ' + status + '">' + getStatusIcon(status) + '</span>' +
+          '<span class="tc-title">' + escapeHtml(title || 'Tool Call') + '</span>' +
+          (kind ? '<span class="tc-kind">' + escapeHtml(kind) + '</span>' : '') +
+        '</div>' +
+        '<pre class="tc-details">' + escapeHtml(details) + '</pre>';
       currentToolsListEl.appendChild(el);
       toolCalls[toolCallId] = el;
+      setActivity((status === 'pending' || status === 'in_progress' || status === 'running')
+        ? ('Running: ' + (title || 'tool'))
+        : null);
       scrollToBottom();
     }
 
@@ -2051,20 +2300,23 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       scrollToBottom();
     }
 
-    function updateToolCall(toolCallId, status, title) {
+    function updateToolCall(toolCallId, status, title, extra) {
       for (let i = chatHistory.length - 1; i >= 0; i--) {
         if (chatHistory[i].kind === 'toolCall' && chatHistory[i].toolCallId === toolCallId) {
           chatHistory[i].status = status;
           if (title) chatHistory[i].title = title;
+          if (extra) chatHistory[i].extra = Object.assign({}, chatHistory[i].extra || {}, extra);
           break;
         }
       }
       saveState();
 
       const el = toolCalls[toolCallId] || document.getElementById('tc-' + toolCallId);
-      if (!el) return;
+      if (!el) {
+        addToolCallInline(toolCallId, title || 'Tool Call', status || 'pending', extra);
+        return;
+      }
 
-      // Inline style (turn-based)
       const iconEl = el.querySelector('.tc-icon');
       if (iconEl) {
         iconEl.className = 'tc-icon ' + status;
@@ -2073,9 +2325,26 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           const titleEl = el.querySelector('.tc-title');
           if (titleEl) titleEl.textContent = title;
         }
+        if (extra) {
+          const detailsEl = el.querySelector('.tc-details');
+          const merged = Object.assign({}, extra);
+          const text = formatToolDetails(merged);
+          if (detailsEl && text) detailsEl.textContent = text;
+          if (extra.kind) {
+            let kindEl = el.querySelector('.tc-kind');
+            if (!kindEl) {
+              kindEl = document.createElement('span');
+              kindEl.className = 'tc-kind';
+              el.querySelector('.tc-row')?.appendChild(kindEl);
+            }
+            kindEl.textContent = extra.kind;
+          }
+        }
+        setActivity((status === 'pending' || status === 'in_progress' || status === 'running')
+          ? ('Running: ' + (title || el.querySelector('.tc-title')?.textContent || 'tool'))
+          : null);
         return;
       }
-      // Legacy card style fallback
       const badge = el.querySelector('.status-badge');
       if (badge) {
         badge.className = 'status-badge ' + status;
@@ -2085,6 +2354,67 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
         const titleEl = el.querySelector('.title');
         if (titleEl) titleEl.textContent = title;
       }
+    }
+
+    function showPermissionCard(request) {
+      hideEmpty();
+      setActivity('Waiting for your approval…', true);
+      const card = document.createElement('div');
+      card.className = 'permission-card';
+      card.id = 'perm-' + request.requestId;
+      card.dataset.requestId = request.requestId;
+
+      const chips = [];
+      if (request.accessKind) chips.push('<span class="perm-chip">' + escapeHtml(request.accessKind) + '</span>');
+      (request.paths || []).slice(0, 4).forEach(function(p) {
+        chips.push('<span class="perm-chip">' + escapeHtml(p) + '</span>');
+      });
+
+      const detailText = (request.details || []).join('\\n');
+      const buttons = (request.options || []).map(function(opt) {
+        return '<button class="perm-btn ' + escapeHtml(opt.style || 'allow') + '" data-option-id="' + escapeHtml(opt.optionId) + '">' +
+          '<span class="perm-btn-label">' + escapeHtml(opt.label) + '</span>' +
+          '<span class="perm-btn-desc">' + escapeHtml(opt.description || '') + '</span>' +
+        '</button>';
+      }).join('');
+
+      card.innerHTML =
+        '<div class="perm-eyebrow">Approval required</div>' +
+        '<div class="perm-title">' + escapeHtml(request.title || 'Agent wants to continue') + '</div>' +
+        '<div class="perm-summary">' + escapeHtml(request.accessSummary || 'Hermes is requesting permission to run a tool.') + '</div>' +
+        (chips.length ? '<div class="perm-meta">' + chips.join('') + '</div>' : '') +
+        (detailText ? '<pre class="perm-details">' + escapeHtml(detailText) + '</pre>' : '') +
+        '<div class="perm-actions">' + buttons + '</div>';
+
+      card.querySelectorAll('.perm-btn').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          if (card.classList.contains('resolved')) return;
+          const optionId = btn.getAttribute('data-option-id');
+          resolvePermissionCard(card, optionId, btn.querySelector('.perm-btn-label')?.textContent || optionId);
+        });
+      });
+
+      messagesEl.appendChild(card);
+      scrollToBottom();
+    }
+
+    function resolvePermissionCard(card, optionId, label) {
+      card.classList.add('resolved');
+      card.querySelectorAll('.perm-btn').forEach(function(b) { b.disabled = true; });
+      const result = document.createElement('div');
+      result.className = 'perm-result';
+      result.textContent = optionId
+        ? ('You chose: ' + (label || optionId))
+        : 'Request expired / cancelled (denied)';
+      card.appendChild(result);
+      setActivity(null);
+      vscode.postMessage({
+        type: 'permissionResponse',
+        requestId: card.dataset.requestId,
+        optionId: optionId || null,
+        cancelled: !optionId,
+      });
+      scrollToBottom();
     }
 
     function addPlan(plan) {
@@ -2242,6 +2572,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
 
         case 'promptStart':
           setProcessing(true);
+          setActivity('Hermes is working…');
           currentAssistantEl = null;
           currentAssistantText = '';
           currentTurnEl = null;
@@ -2278,14 +2609,15 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
             }
           }
           setProcessing(false);
+          setActivity(null);
           currentAssistantEl = null;
           currentAssistantText = '';
-          // Auto-collapse tool calls in completed turns
-          if (currentToolsListEl && currentToolCount > 3) {
-            currentToolsListEl.classList.add('collapsed');
+          // Keep tool activity expanded so the transcript stays fully visible
+          if (currentToolsListEl) {
+            currentToolsListEl.classList.remove('collapsed');
             if (currentToolsCountEl) {
               currentToolsCountEl.dataset.count = String(currentToolCount);
-              currentToolsCountEl.textContent = '▸ ' + currentToolCount + ' tool calls';
+              currentToolsCountEl.textContent = '▾ ' + currentToolCount + ' tool call' + (currentToolCount !== 1 ? 's' : '');
             }
           }
           currentTurnEl = null;
@@ -2298,6 +2630,20 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           thoughtStartTime = null;
           thoughtEndTime = null;
           break;
+
+        case 'permissionRequest':
+          if (msg.request) {
+            showPermissionCard(msg.request);
+          }
+          break;
+
+        case 'permissionExpired': {
+          const expired = document.getElementById('perm-' + msg.requestId);
+          if (expired && !expired.classList.contains('resolved')) {
+            resolvePermissionCard(expired, null, null);
+          }
+          break;
+        }
 
         case 'clearChat':
           chatHistory = [];
@@ -2482,6 +2828,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
             tc.toolCallId || 'unknown',
             tc.title || 'Tool Call',
             tc.status || 'pending',
+            tc,
           );
           break;
         }
@@ -2491,6 +2838,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
             update.toolCallId || 'unknown',
             update.status || 'completed',
             update.title,
+            update,
           );
           break;
         }
@@ -2548,7 +2896,40 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /**
+   * Show a Cursor-like permission card in chat and wait for the user's choice.
+   */
+  async promptPermission(request: PermissionUiRequest): Promise<RequestPermissionResponse> {
+    await this.view?.show?.(true);
+    this._hasChatContent = true;
+
+    return new Promise<RequestPermissionResponse>((resolve) => {
+      this.pendingPermissions.set(request.requestId, { resolve });
+      this.postMessage({
+        type: 'permissionRequest',
+        request,
+      });
+
+      // Fail closed if the user never answers (Hermes also has its own timeout).
+      setTimeout(() => {
+        if (!this.pendingPermissions.has(request.requestId)) {
+          return;
+        }
+        this.pendingPermissions.delete(request.requestId);
+        this.postMessage({
+          type: 'permissionExpired',
+          requestId: request.requestId,
+        });
+        resolve({ outcome: { outcome: 'cancelled' } });
+      }, 300_000);
+    });
+  }
+
   dispose(): void {
+    for (const [, pending] of this.pendingPermissions) {
+      pending.resolve({ outcome: { outcome: 'cancelled' } });
+    }
+    this.pendingPermissions.clear();
     this.sessionUpdateHandler.removeListener(this.updateListener);
   }
 }

@@ -8,6 +8,7 @@ import { SessionUpdateHandler } from './handlers/SessionUpdateHandler';
 import { SessionTreeProvider } from './ui/SessionTreeProvider';
 import { StatusBarManager } from './ui/StatusBarManager';
 import { ChatWebviewProvider } from './ui/ChatWebviewProvider';
+import { PermissionHandler } from './handlers/PermissionHandler';
 import { getAgentNames } from './config/AgentConfig';
 import { fetchRegistry } from './config/RegistryClient';
 import { log, logError, disposeChannels, getOutputChannel, getTrafficChannel } from './utils/Logger';
@@ -21,7 +22,8 @@ export function activate(context: vscode.ExtensionContext): void {
   // --- Core services ---
   const sessionUpdateHandler = new SessionUpdateHandler();
   const agentManager = new AgentManager();
-  const connectionManager = new ConnectionManager(sessionUpdateHandler);
+  const permissionHandler = new PermissionHandler();
+  const connectionManager = new ConnectionManager(sessionUpdateHandler, permissionHandler);
   const sessionManager = new SessionManager(
     agentManager,
     connectionManager,
@@ -47,6 +49,8 @@ export function activate(context: vscode.ExtensionContext): void {
     sessionManager,
     sessionUpdateHandler,
   );
+  // Route Hermes permission requests into the chat panel (Cursor-like cards).
+  permissionHandler.setUiPrompt((req) => chatWebviewProvider.promptPermission(req));
   const chatViewRegistration = vscode.window.registerWebviewViewProvider(
     ChatWebviewProvider.viewType,
     chatWebviewProvider,

@@ -1,8 +1,8 @@
 {
   "name": "hermes-ide",
   "displayName": "Hermes Local IDE",
-  "description": "Local VS Code chat for Hermes via ACP (fork of formulahendry/vscode-acp; Hermes-only, no telemetry).",
-  "version": "0.1.0",
+  "description": "Local VS Code chat for Hermes via ACP (v0.2: live tool activity + Cursor-like approval cards).",
+  "version": "0.2.0",
   "publisher": "hermes-ide",
   "license": "MIT",
   "icon": "resources/icon.png",
