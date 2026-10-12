@@ -1,11 +1,64 @@
 import * as vscode from 'vscode';
 import { marked } from 'marked';
+import hljs from 'highlight.js/lib/core';
+import bash from 'highlight.js/lib/languages/bash';
+import c from 'highlight.js/lib/languages/c';
+import cpp from 'highlight.js/lib/languages/cpp';
+import csharp from 'highlight.js/lib/languages/csharp';
+import css from 'highlight.js/lib/languages/css';
+import diff from 'highlight.js/lib/languages/diff';
+import go from 'highlight.js/lib/languages/go';
+import java from 'highlight.js/lib/languages/java';
+import javascript from 'highlight.js/lib/languages/javascript';
+import json from 'highlight.js/lib/languages/json';
+import markdown from 'highlight.js/lib/languages/markdown';
+import python from 'highlight.js/lib/languages/python';
+import rust from 'highlight.js/lib/languages/rust';
+import sql from 'highlight.js/lib/languages/sql';
+import typescript from 'highlight.js/lib/languages/typescript';
+import xml from 'highlight.js/lib/languages/xml';
+import yaml from 'highlight.js/lib/languages/yaml';
 import { SessionManager } from '../core/SessionManager';
+import {
+  hermesModeForInteraction,
+  isInteractionModeId,
+  wrapPromptForMode,
+  type InteractionModeId,
+} from '../core/InteractionMode';
 import { SessionUpdateHandler, SessionUpdateListener } from '../handlers/SessionUpdateHandler';
-import type { PermissionUiRequest } from '../handlers/PermissionHandler';
+import type { AutoPermissionNotice, PermissionUiRequest } from '../handlers/PermissionHandler';
 import type { RequestPermissionResponse, SessionNotification } from '@agentclientprotocol/sdk';
-import { logError } from '../utils/Logger';
+import { log, logError } from '../utils/Logger';
 import { sendEvent } from '../utils/TelemetryManager';
+
+// Register a focused language set (offline, no CDN, keeps the bundle small).
+hljs.registerLanguage('bash', bash);
+hljs.registerLanguage('shell', bash);
+hljs.registerLanguage('sh', bash);
+hljs.registerLanguage('c', c);
+hljs.registerLanguage('cpp', cpp);
+hljs.registerLanguage('csharp', csharp);
+hljs.registerLanguage('cs', csharp);
+hljs.registerLanguage('css', css);
+hljs.registerLanguage('diff', diff);
+hljs.registerLanguage('go', go);
+hljs.registerLanguage('java', java);
+hljs.registerLanguage('javascript', javascript);
+hljs.registerLanguage('js', javascript);
+hljs.registerLanguage('json', json);
+hljs.registerLanguage('markdown', markdown);
+hljs.registerLanguage('md', markdown);
+hljs.registerLanguage('python', python);
+hljs.registerLanguage('py', python);
+hljs.registerLanguage('rust', rust);
+hljs.registerLanguage('sql', sql);
+hljs.registerLanguage('typescript', typescript);
+hljs.registerLanguage('ts', typescript);
+hljs.registerLanguage('tsx', typescript);
+hljs.registerLanguage('xml', xml);
+hljs.registerLanguage('html', xml);
+hljs.registerLanguage('yaml', yaml);
+hljs.registerLanguage('yml', yaml);
 
 /**
  * WebviewViewProvider for the ACP chat sidebar.
@@ -17,6 +70,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private updateListener: SessionUpdateListener;
   private _hasChatContent = false;
+  private interactionMode: InteractionModeId = 'agent';
   private pendingPermissions = new Map<
     string,
     { resolve: (value: RequestPermissionResponse) => void }
@@ -27,10 +81,46 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     private readonly sessionManager: SessionManager,
     private readonly sessionUpdateHandler: SessionUpdateHandler,
   ) {
-    // Configure marked for safe rendering
+    this.interactionMode = this.readInteractionModeSetting();
+    // Markdown + offline syntax highlighting (no CDN).
     marked.setOptions({
       breaks: true,
       gfm: true,
+    });
+    marked.use({
+      renderer: {
+        code({ text, lang }: { text: string; lang?: string }) {
+          const rawLang = (lang || '').trim().split(/\s+/)[0] || '';
+          const normalized = rawLang.toLowerCase();
+          let language = normalized && hljs.getLanguage(normalized) ? normalized : '';
+          let highlighted: string;
+          try {
+            if (language) {
+              highlighted = hljs.highlight(text, { language }).value;
+            } else {
+              // Prefer common coding languages when the fence has no tag.
+              const auto = hljs.highlightAuto(text, [
+                'python', 'javascript', 'typescript', 'json', 'bash', 'markdown', 'yaml', 'sql',
+              ]);
+              highlighted = auto.value;
+              language = auto.language || 'text';
+            }
+          } catch {
+            highlighted = text
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;');
+            language = language || 'text';
+          }
+          const label = language || 'code';
+          return (
+            `<div class="code-block" data-lang="${label}">` +
+            `<div class="code-block-header"><span class="code-lang">${label}</span></div>` +
+            `<pre class="hljs"><code class="language-${label}">${highlighted}</code></pre>` +
+            `</div>\n`
+          );
+        },
+      },
     });
 
     // Register as a session update listener
@@ -41,7 +131,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Render markdown text to HTML using marked.
+   * Render markdown text to HTML using marked + highlight.js.
    */
   private renderMarkdown(text: string): string {
     try {
@@ -90,6 +180,9 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
         case 'setMode':
           await this.handleSetMode(message.modeId);
           break;
+        case 'setInteractionMode':
+          await this.handleSetInteractionMode(message.modeId);
+          break;
         case 'setModel':
           await this.handleSetModel(message.modelId);
           break;
@@ -129,6 +222,10 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
               outcome: { outcome: 'selected', optionId: String(message.optionId) },
             });
           }
+          break;
+        }
+        case 'openFilePreview': {
+          await this.openFilePreview(String(message.path || ''));
           break;
         }
       }
@@ -181,6 +278,68 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  getInteractionMode(): InteractionModeId {
+    return this.interactionMode;
+  }
+
+  private readInteractionModeSetting(): InteractionModeId {
+    const raw = vscode.workspace
+      .getConfiguration('acp')
+      .get<string>('defaultInteractionMode', 'agent');
+    return isInteractionModeId(raw) ? raw : 'agent';
+  }
+
+  /**
+   * Apply the current interaction mode to Hermes (edit-approval session mode)
+   * and refresh the chat mode control.
+   */
+  async onActiveSessionChanged(): Promise<void> {
+    this.sendCurrentState();
+    await this.syncHermesEditMode();
+  }
+
+  private async handleSetInteractionMode(modeId: unknown): Promise<void> {
+    if (!isInteractionModeId(modeId)) {
+      return;
+    }
+    this.interactionMode = modeId;
+    try {
+      await vscode.workspace
+        .getConfiguration('acp')
+        .update('defaultInteractionMode', modeId, vscode.ConfigurationTarget.Workspace);
+    } catch (e) {
+      logError('Failed to persist interaction mode', e);
+    }
+    this.postMessage({ type: 'interactionModeUpdate', modeId });
+    await this.syncHermesEditMode();
+  }
+
+  /**
+   * Map Agent → accept_edits, Ask/Plan → default (ask before edits on Hermes side).
+   */
+  private async syncHermesEditMode(): Promise<void> {
+    const activeId = this.sessionManager.getActiveSessionId();
+    if (!activeId) {
+      return;
+    }
+    const session = this.sessionManager.getSession(activeId);
+    const target = hermesModeForInteraction(this.interactionMode);
+    const available = session?.modes?.availableModes?.map((m) => m.id) ?? [];
+    if (available.length > 0 && !available.includes(target)) {
+      log(`Hermes does not advertise mode "${target}" — skipping setMode`);
+      return;
+    }
+    if (session?.modes?.currentModeId === target) {
+      return;
+    }
+    try {
+      await this.sessionManager.setMode(activeId, target);
+      log(`Applied Hermes edit mode "${target}" for interaction mode "${this.interactionMode}"`);
+    } catch (e: any) {
+      logError('Failed to sync Hermes edit mode', e);
+    }
+  }
+
   /**
    * Handle a prompt sent from the webview.
    */
@@ -207,8 +366,11 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     // Tell webview we're processing
     this.postMessage({ type: 'promptStart' });
 
+    // Ask / Plan get a soft host prefix; chat UI still shows the user's text only.
+    const promptText = wrapPromptForMode(this.interactionMode, text);
+
     try {
-      const response = await this.sessionManager.sendPrompt(activeId, text);
+      const response = await this.sessionManager.sendPrompt(activeId, promptText);
       // Render the accumulated assistant text as markdown
       // The webview will have sent us the raw text via promptEnd handling
       this.postMessage({
@@ -302,6 +464,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     this.postMessage({
       type: 'state',
       activeSessionId: activeId,
+      interactionMode: this.interactionMode,
       session: session ? {
         sessionId: session.sessionId,
         agentName: session.agentDisplayName,
@@ -326,7 +489,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
    * Notify webview of a new active session.
    */
   notifyActiveSessionChanged(): void {
-    this.sendCurrentState();
+    void this.onActiveSessionChanged();
   }
 
   /**
@@ -386,10 +549,44 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * Open a workspace/local file in the editor (preview mode).
+   */
+  private async openFilePreview(filePath: string): Promise<void> {
+    const trimmed = filePath.trim();
+    if (!trimmed || trimmed.includes('\0')) {
+      vscode.window.showWarningMessage('No file path available to preview.');
+      return;
+    }
+    try {
+      const uri = vscode.Uri.file(trimmed);
+      const doc = await vscode.workspace.openTextDocument(uri);
+      await vscode.window.showTextDocument(doc, {
+        preview: true,
+        preserveFocus: false,
+        viewColumn: vscode.ViewColumn.One,
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      vscode.window.showErrorMessage(`Could not open file preview: ${msg}`);
+    }
+  }
+
+  /**
    * Generate the HTML content for the webview.
    */
   private getHtmlContent(webview: vscode.Webview): string {
     const nonce = getNonce();
+    const themeKind = vscode.window.activeColorTheme.kind;
+    const lightTheme =
+      themeKind === vscode.ColorThemeKind.Light ||
+      themeKind === vscode.ColorThemeKind.HighContrastLight;
+    const hljsCss = webview.asWebviewUri(
+      vscode.Uri.joinPath(
+        this.extensionUri,
+        'media',
+        lightTheme ? 'hljs-github.min.css' : 'hljs-github-dark.min.css',
+      ),
+    );
 
     return /*html*/ `<!DOCTYPE html>
 <html lang="en">
@@ -397,6 +594,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+  <link rel="stylesheet" href="${hljsCss}">
   <title>ACP Chat</title>
   <style>
     :root {
@@ -483,15 +681,15 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       margin-bottom: 0;
     }
     .message.assistant.md-rendered pre {
-      background: var(--vscode-textCodeBlock-background);
-      border: 1px solid var(--vscode-panel-border);
-      border-radius: 4px;
-      padding: 8px 10px;
+      background: transparent;
+      border: none;
+      border-radius: 0;
+      padding: 0;
       overflow-x: auto;
-      margin: 0.5em 0;
+      margin: 0;
       font-family: var(--vscode-editor-font-family);
-      font-size: 0.9em;
-      line-height: 1.4;
+      font-size: 0.88em;
+      line-height: 1.45;
     }
     .message.assistant.md-rendered code {
       font-family: var(--vscode-editor-font-family);
@@ -504,6 +702,33 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       background: none;
       padding: 0;
       border-radius: 0;
+      display: block;
+    }
+    .message.assistant.md-rendered .code-block {
+      margin: 0.65em 0;
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 8px;
+      overflow: hidden;
+      background: var(--vscode-textCodeBlock-background);
+    }
+    .message.assistant.md-rendered .code-block-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 4px 10px;
+      border-bottom: 1px solid var(--vscode-panel-border);
+      background: var(--vscode-editorWidget-background);
+      font-size: 0.75em;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      opacity: 0.85;
+    }
+    .message.assistant.md-rendered .code-block .hljs {
+      padding: 10px 12px;
+      margin: 0;
+      max-height: 420px;
+      overflow: auto;
+      background: transparent;
     }
     .message.assistant.md-rendered ul,
     .message.assistant.md-rendered ol {
@@ -618,13 +843,39 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       border: 1px solid var(--vscode-inputValidation-errorBorder);
     }
 
-    /* Turn container — groups assistant text + tool calls */
+    /* Turn: completed work scrolls up; live writing stays near the input */
     .turn {
       display: flex;
       flex-direction: column;
+      gap: 6px;
+      align-self: stretch;
+      max-width: 100%;
+      width: 100%;
+    }
+    .turn-timeline {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      order: 1;
+    }
+    .turn-live {
+      display: flex;
+      flex-direction: column;
       gap: 4px;
-      align-self: flex-start;
-      max-width: 95%;
+      order: 2;
+      position: sticky;
+      bottom: 0;
+      z-index: 3;
+      padding: 4px 0 2px;
+      background: linear-gradient(
+        to bottom,
+        color-mix(in srgb, var(--vscode-sideBar-background) 0%, transparent),
+        var(--vscode-sideBar-background) 18%
+      );
+    }
+    .turn-live > .message.assistant {
+      max-width: 100%;
+      align-self: stretch;
     }
 
     /* Tool calls group inside a turn */
@@ -632,35 +883,100 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       display: flex;
       flex-direction: column;
       gap: 2px;
-      padding-left: 10px;
+      padding-left: 8px;
       border-left: 2px solid var(--vscode-panel-border);
-      margin: 2px 0;
+      margin: 0;
     }
     .turn-tools-summary {
-      font-size: 0.8em;
-      opacity: 0.6;
+      font-size: 0.78em;
+      opacity: 0.55;
       cursor: pointer;
-      padding: 2px 0;
+      padding: 1px 0;
       user-select: none;
     }
     .turn-tools-summary:hover { opacity: 0.9; }
-    .turn-tools-list { }
+    .turn-tools-list {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
     .turn-tools-list.collapsed { display: none; }
 
-    /* Live activity strip */
-    .activity-banner {
-      display: none;
+    /* Compact completed steps (Cursor-like) */
+    .tool-call-inline.is-compact {
+      padding: 2px 6px;
+      gap: 0;
+      opacity: 0.8;
+      background: transparent;
+      border-color: transparent;
+      cursor: pointer;
+    }
+    .tool-call-inline.is-compact .tc-diff,
+    .tool-call-inline.is-compact .tc-details,
+    .tool-call-inline.is-compact .tc-actions,
+    .tool-call-inline.is-compact .tc-kind {
+      display: none !important;
+    }
+    .tool-call-inline.is-compact .tc-title {
+      font-weight: 500;
+      font-size: 0.92em;
+    }
+    .tool-call-inline.is-compact.is-open {
+      opacity: 1;
+      background: var(--vscode-editorWidget-background);
+      border-color: var(--vscode-panel-border);
+    }
+    .tool-call-inline.is-compact.is-open .tc-diff,
+    .tool-call-inline.is-compact.is-open .tc-details,
+    .tool-call-inline.is-compact.is-open .tc-actions,
+    .tool-call-inline.is-compact.is-open .tc-kind {
+      display: block !important;
+    }
+    .tool-call-inline.is-compact.is-open .tc-actions {
+      display: flex !important;
+    }
+    .tool-call-inline.is-active {
+      border-color: color-mix(in srgb, var(--vscode-progressBar-background) 50%, var(--vscode-panel-border));
+    }
+
+    .decision-row {
+      display: flex;
       align-items: center;
-      gap: 8px;
-      padding: 6px 10px;
+      gap: 6px;
+      padding: 2px 6px;
+      font-size: 0.8em;
+      opacity: 0.75;
+      border-radius: 4px;
+      cursor: default;
+    }
+    .decision-row.allow { color: var(--vscode-testing-iconPassed, inherit); }
+    .decision-row.deny { color: var(--vscode-testing-iconFailed, inherit); }
+    .decision-row .decision-label {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* Live activity + stats strip */
+    .live-strip {
+      display: none;
+      flex-direction: column;
+      gap: 4px;
       margin: 0 0 8px;
+      padding: 6px 10px;
       border-radius: 6px;
       background: var(--vscode-editorWidget-background);
       border: 1px solid var(--vscode-panel-border);
-      font-size: 0.85em;
+      font-size: 0.8em;
+    }
+    .live-strip.visible { display: flex; }
+    .activity-banner {
+      display: flex;
+      align-items: center;
+      gap: 8px;
       opacity: 0.95;
     }
-    .activity-banner.visible { display: flex; }
+    .activity-banner.idle { display: none; }
     .activity-dot {
       width: 7px;
       height: 7px;
@@ -671,6 +987,70 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     }
     .activity-banner.waiting .activity-dot {
       background: var(--vscode-charts-orange, #cc7a00);
+    }
+    .stats-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 12px;
+      opacity: 0.85;
+      font-variant-numeric: tabular-nums;
+    }
+    .stats-bar .stat {
+      white-space: nowrap;
+    }
+    .stats-bar .stat strong {
+      font-weight: 600;
+      opacity: 1;
+    }
+    .status-chip {
+      align-self: flex-start;
+      margin: 4px 0;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 0.8em;
+      opacity: 0.9;
+      background: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
+    }
+    .status-chip.allow {
+      background: color-mix(in srgb, var(--vscode-testing-iconPassed) 22%, transparent);
+      color: var(--vscode-foreground);
+    }
+    .status-chip.deny {
+      background: color-mix(in srgb, var(--vscode-testing-iconFailed) 22%, transparent);
+      color: var(--vscode-foreground);
+    }
+    .tool-call-inline.is-edit {
+      border-color: color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 45%, var(--vscode-panel-border));
+    }
+    .tool-call-inline .tc-diff {
+      margin: 0;
+      padding: 6px 8px;
+      border-radius: 4px;
+      background: var(--vscode-textCodeBlock-background, rgba(127,127,127,0.12));
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 0.75em;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 220px;
+      overflow-y: auto;
+      line-height: 1.35;
+    }
+    .tool-call-inline .tc-diff .diff-add {
+      color: var(--vscode-gitDecoration-addedResourceForeground, #3fb950);
+    }
+    .tool-call-inline .tc-diff .diff-del {
+      color: var(--vscode-gitDecoration-deletedResourceForeground, #f85149);
+    }
+    .tool-call-inline .tc-diff .diff-meta {
+      opacity: 0.7;
+    }
+    .message.assistant.streaming-cursor::after {
+      content: '▍';
+      display: inline-block;
+      margin-left: 1px;
+      animation: thoughtPulse 1s ease-in-out infinite;
+      color: var(--vscode-progressBar-background);
     }
 
     /* Compact inline tool call — expandable details */
@@ -725,76 +1105,102 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       overflow-y: auto;
     }
     .tool-call-inline .tc-details:empty { display: none; }
+    .tool-call-inline .tc-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 2px;
+    }
+    .tool-call-inline .tc-action {
+      font-size: 0.75em;
+      padding: 2px 8px;
+      border-radius: 4px;
+      border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .tool-call-inline .tc-action:hover {
+      background: var(--vscode-button-secondaryHoverBackground, var(--vscode-toolbar-hoverBackground));
+    }
+    .tool-call-inline.is-read .tc-details {
+      display: none;
+    }
+    .tool-call-inline.is-read.expanded .tc-details {
+      display: block;
+    }
+    .tool-call-inline.is-read .tc-title {
+      font-weight: 600;
+    }
 
-    /* Permission card — Cursor-like approval */
+    /* Permission card — only expanded while waiting; then collapses to a decision row */
     .permission-card {
       align-self: stretch;
-      margin: 8px 0;
-      padding: 12px;
+      margin: 0;
+      padding: 10px;
       border-radius: 8px;
       border: 1px solid var(--vscode-focusBorder, var(--vscode-panel-border));
       background: var(--vscode-editorWidget-background);
       display: flex;
       flex-direction: column;
-      gap: 10px;
-    }
-    .permission-card.resolved {
-      opacity: 0.65;
-      border-color: var(--vscode-panel-border);
+      gap: 8px;
     }
     .permission-card .perm-eyebrow {
-      font-size: 0.75em;
+      font-size: 0.72em;
       text-transform: uppercase;
       letter-spacing: 0.04em;
       opacity: 0.7;
       font-weight: 600;
     }
     .permission-card .perm-title {
-      font-size: 1em;
+      font-size: 0.95em;
       font-weight: 650;
-      line-height: 1.35;
+      line-height: 1.3;
     }
     .permission-card .perm-summary {
-      font-size: 0.9em;
-      line-height: 1.4;
+      font-size: 0.85em;
+      line-height: 1.35;
+      opacity: 0.9;
     }
     .permission-card .perm-meta {
       display: flex;
       flex-wrap: wrap;
-      gap: 6px;
+      gap: 4px;
     }
     .permission-card .perm-chip {
-      font-size: 0.75em;
-      padding: 2px 8px;
+      font-size: 0.72em;
+      padding: 1px 7px;
       border-radius: 999px;
       background: var(--vscode-badge-background);
       color: var(--vscode-badge-foreground);
     }
     .permission-card .perm-details {
       margin: 0;
-      padding: 8px 10px;
+      padding: 6px 8px;
       border-radius: 6px;
       background: var(--vscode-textCodeBlock-background, rgba(127,127,127,0.12));
       font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 0.82em;
+      font-size: 0.78em;
       white-space: pre-wrap;
       word-break: break-word;
-      max-height: 220px;
+      max-height: 140px;
       overflow-y: auto;
     }
     .permission-card .perm-actions {
       display: flex;
-      flex-direction: column;
+      flex-direction: row;
+      flex-wrap: wrap;
       gap: 6px;
     }
     .permission-card .perm-btn {
       display: flex;
       flex-direction: column;
       align-items: flex-start;
-      gap: 2px;
-      width: 100%;
+      gap: 1px;
+      flex: 1 1 120px;
       text-align: left;
-      padding: 8px 10px;
+      padding: 6px 8px;
       border-radius: 6px;
       border: 1px solid var(--vscode-button-border, transparent);
       cursor: pointer;
@@ -802,12 +1208,16 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     }
     .permission-card .perm-btn .perm-btn-label {
       font-weight: 600;
-      font-size: 0.9em;
+      font-size: 0.85em;
     }
     .permission-card .perm-btn .perm-btn-desc {
-      font-size: 0.78em;
-      opacity: 0.8;
-      line-height: 1.35;
+      font-size: 0.72em;
+      opacity: 0.75;
+      line-height: 1.3;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
     }
     .permission-card .perm-btn.allow {
       background: var(--vscode-button-background);
@@ -828,10 +1238,6 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     .permission-card .perm-btn:disabled {
       opacity: 0.5;
       cursor: default;
-    }
-    .permission-card .perm-result {
-      font-size: 0.85em;
-      opacity: 0.85;
     }
 
     /* Legacy standalone tool-call card (for history restore) */
@@ -1003,6 +1409,39 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       padding: 4px var(--container-padding) 0;
       flex-shrink: 0;
       flex-wrap: wrap;
+    }
+
+    /* Agent / Ask / Plan segmented control */
+    .interaction-modes {
+      display: inline-flex;
+      align-items: stretch;
+      border: 1px solid var(--vscode-dropdown-border, rgba(128,128,128,0.35));
+      border-radius: 4px;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+    .interaction-mode-btn {
+      border: none;
+      background: transparent;
+      color: var(--vscode-foreground);
+      font-family: var(--vscode-font-family);
+      font-size: calc(var(--vscode-font-size) - 1px);
+      padding: 2px 10px;
+      cursor: pointer;
+      opacity: 0.75;
+      line-height: 1.4;
+    }
+    .interaction-mode-btn + .interaction-mode-btn {
+      border-left: 1px solid var(--vscode-dropdown-border, rgba(128,128,128,0.35));
+    }
+    .interaction-mode-btn:hover {
+      background: var(--vscode-toolbar-hoverBackground);
+      opacity: 1;
+    }
+    .interaction-mode-btn.active {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      opacity: 1;
     }
 
     /* Picker wrapper — positioned relatively to anchor the dropdown */
@@ -1314,9 +1753,18 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     <span class="status" id="status"></span>
   </div>
 
-  <div class="activity-banner" id="activityBanner" aria-live="polite">
-    <span class="activity-dot"></span>
-    <span id="activityText">Working…</span>
+  <div class="live-strip" id="liveStrip" aria-live="polite">
+    <div class="activity-banner idle" id="activityBanner">
+      <span class="activity-dot"></span>
+      <span id="activityText">Working…</span>
+    </div>
+    <div class="stats-bar" id="statsBar">
+      <span class="stat" id="statElapsed">—</span>
+      <span class="stat" id="statTokPerSec">—</span>
+      <span class="stat" id="statTokens">—</span>
+      <span class="stat" id="statContext">—</span>
+      <span class="stat" id="statTools">—</span>
+    </div>
   </div>
   <div class="messages" id="messages">
     <div class="empty-state" id="emptyState">
@@ -1341,9 +1789,17 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     </div>
     <div class="input-resize-handle" id="resizeHandle"></div>
     <div class="input-toolbar">
+      <div class="interaction-modes" id="interactionModes" role="group" aria-label="Chat mode">
+        <button type="button" class="interaction-mode-btn active" data-mode="agent"
+          title="Edit and run tools. Code changes allowed by default.">Agent</button>
+        <button type="button" class="interaction-mode-btn" data-mode="ask"
+          title="Answer questions only. File edits are blocked.">Ask</button>
+        <button type="button" class="interaction-mode-btn" data-mode="plan"
+          title="Propose a plan. Do not modify files until you switch to Agent.">Plan</button>
+      </div>
       <!-- Dynamic config-options pickers (ACP "Session Config Options"). -->
       <div class="picker-row" id="configOptionsContainer"></div>
-      <!-- Legacy pickers — used only when the agent has not migrated to configOptions -->
+      <!-- Hermes edit-approval modes are driven by Agent/Ask/Plan — keep this hidden. -->
       <div class="picker-wrap hidden" id="modePickerWrap">
         <button class="picker-btn" id="modePickerBtn" title="Select mode">
           <span class="picker-icon">⚡</span>
@@ -1396,22 +1852,132 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     const inputArea = document.getElementById('inputArea');
     const resizeHandle = document.getElementById('resizeHandle');
     const slashPopup = document.getElementById('slashPopup');
+    const liveStrip = document.getElementById('liveStrip');
     const activityBanner = document.getElementById('activityBanner');
     const activityText = document.getElementById('activityText');
+    const statElapsed = document.getElementById('statElapsed');
+    const statTokPerSec = document.getElementById('statTokPerSec');
+    const statTokens = document.getElementById('statTokens');
+    const statContext = document.getElementById('statContext');
+    const statTools = document.getElementById('statTools');
+
+    let turnStartMs = 0;
+    let streamedOutChars = 0;
+    let liveToolCount = 0;
+    let lastUsage = null; // { inputTokens, outputTokens, totalTokens, thoughtTokens }
+    let contextUsed = 0;
+    let contextSize = 0;
+    let statsTimer = null;
+    let activityFallback = 'Thinking…';
+
+    function formatNum(n) {
+      if (n == null || !isFinite(n)) return '—';
+      if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+      if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+      return String(Math.round(n));
+    }
+
+    function approxTokensFromChars(chars) {
+      return Math.max(0, Math.round(chars / 4));
+    }
+
+    function refreshStatsBar() {
+      const elapsedSec = turnStartMs ? Math.max(0, (Date.now() - turnStartMs) / 1000) : 0;
+      const liveOut = lastUsage && lastUsage.outputTokens != null
+        ? lastUsage.outputTokens
+        : approxTokensFromChars(streamedOutChars);
+      const tokPerSec = elapsedSec >= 0.4 ? (liveOut / elapsedSec) : 0;
+
+      if (statElapsed) {
+        statElapsed.innerHTML = turnStartMs
+          ? ('⏱ <strong>' + elapsedSec.toFixed(1) + 's</strong>')
+          : '⏱ —';
+      }
+      if (statTokPerSec) {
+        statTokPerSec.innerHTML = tokPerSec > 0
+          ? ('⚡ <strong>' + tokPerSec.toFixed(1) + '</strong> tok/s')
+          : '⚡ — tok/s';
+      }
+      if (statTokens) {
+        if (lastUsage) {
+          const parts = [];
+          if (lastUsage.inputTokens != null) parts.push('in ' + formatNum(lastUsage.inputTokens));
+          if (lastUsage.outputTokens != null) parts.push('out ' + formatNum(lastUsage.outputTokens));
+          if (lastUsage.thoughtTokens) parts.push('think ' + formatNum(lastUsage.thoughtTokens));
+          statTokens.innerHTML = parts.length
+            ? ('🔤 <strong>' + parts.join(' · ') + '</strong>')
+            : ('🔤 ~' + formatNum(liveOut) + ' out');
+        } else if (streamedOutChars > 0) {
+          statTokens.innerHTML = '🔤 ~<strong>' + formatNum(liveOut) + '</strong> out';
+        } else {
+          statTokens.textContent = '🔤 —';
+        }
+      }
+      if (statContext) {
+        if (contextSize > 0) {
+          const pct = Math.min(100, Math.round((contextUsed / contextSize) * 100));
+          statContext.innerHTML =
+            '📊 <strong>' + formatNum(contextUsed) + '</strong>/' + formatNum(contextSize) +
+            ' (' + pct + '%)';
+        } else {
+          statContext.textContent = '📊 context —';
+        }
+      }
+      if (statTools) {
+        statTools.innerHTML = liveToolCount > 0
+          ? ('🔧 <strong>' + liveToolCount + '</strong> tools')
+          : '🔧 —';
+      }
+
+      if (liveStrip) {
+        const show = isProcessing || contextSize > 0 || !!lastUsage || liveToolCount > 0;
+        liveStrip.classList.toggle('visible', show);
+      }
+    }
+
+    function startStatsTimer() {
+      if (statsTimer) return;
+      statsTimer = setInterval(refreshStatsBar, 400);
+    }
+
+    function stopStatsTimer() {
+      if (statsTimer) {
+        clearInterval(statsTimer);
+        statsTimer = null;
+      }
+      refreshStatsBar();
+    }
 
     function setActivity(text, waiting) {
       if (!activityBanner || !activityText) return;
       if (!text) {
-        activityBanner.classList.remove('visible', 'waiting');
-        activityText.textContent = '';
-        return;
+        if (isProcessing) {
+          text = activityFallback;
+          waiting = false;
+        } else {
+          activityBanner.classList.add('idle');
+          activityBanner.classList.remove('waiting');
+          activityText.textContent = '';
+          refreshStatsBar();
+          return;
+        }
       }
       activityText.textContent = text;
-      activityBanner.classList.add('visible');
+      activityBanner.classList.remove('idle');
       activityBanner.classList.toggle('waiting', !!waiting);
+      if (liveStrip) liveStrip.classList.add('visible');
+      refreshStatsBar();
+    }
+
+    function noteStreamChars(text) {
+      if (typeof text === 'string' && text.length) {
+        streamedOutChars += text.length;
+        refreshStatsBar();
+      }
     }
 
     // Picker elements
+    const interactionModesEl = document.getElementById('interactionModes');
     const modePickerWrap = document.getElementById('modePickerWrap');
     const modePickerBtn = document.getElementById('modePickerBtn');
     const modePickerLabel = document.getElementById('modePickerLabel');
@@ -1421,6 +1987,27 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     const modelPickerLabel = document.getElementById('modelPickerLabel');
     const modelDropdown = document.getElementById('modelDropdown');
     const configOptionsContainer = document.getElementById('configOptionsContainer');
+    let currentInteractionMode = 'agent';
+
+    function setInteractionModeUi(modeId) {
+      currentInteractionMode = modeId || 'agent';
+      if (!interactionModesEl) return;
+      interactionModesEl.querySelectorAll('.interaction-mode-btn').forEach(function(btn) {
+        btn.classList.toggle('active', btn.getAttribute('data-mode') === currentInteractionMode);
+      });
+      updatePlaceholder();
+    }
+
+    if (interactionModesEl) {
+      interactionModesEl.addEventListener('click', function(e) {
+        const btn = e.target.closest('.interaction-mode-btn');
+        if (!btn) return;
+        const modeId = btn.getAttribute('data-mode');
+        if (!modeId || modeId === currentInteractionMode) return;
+        setInteractionModeUi(modeId);
+        vscode.postMessage({ type: 'setInteractionMode', modeId: modeId });
+      });
+    }
 
     let hasActiveSession = false;
     let isProcessing = false;
@@ -1446,12 +2033,25 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     let availableCommands = [];
     let slashPopupSelectedIdx = -1;
     let slashFilteredCommands = [];
-    let savedPlaceholder = 'Type a message...';
+    let savedPlaceholder = 'Ask Hermes to edit code, run tools…';
+
+    function modePlaceholder() {
+      const placeholders = {
+        agent: availableCommands.length > 0
+          ? 'Ask Hermes to edit code, or / for commands…'
+          : 'Ask Hermes to edit code, run tools…',
+        ask: availableCommands.length > 0
+          ? 'Ask a question (read-only), or / for commands…'
+          : 'Ask a question (read-only)…',
+        plan: availableCommands.length > 0
+          ? 'Describe what to plan, or / for commands…'
+          : 'Describe what to plan…',
+      };
+      return placeholders[currentInteractionMode] || placeholders.agent;
+    }
 
     function updatePlaceholder() {
-      savedPlaceholder = availableCommands.length > 0
-        ? 'Type a message or / for commands...'
-        : 'Type a message...';
+      savedPlaceholder = modePlaceholder();
       if (!promptInput.value.startsWith('/')) {
         promptInput.placeholder = savedPlaceholder;
       }
@@ -1510,10 +2110,13 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     let currentAssistantEl = null;
     let currentAssistantText = '';
     let currentTurnEl = null;       // .turn container for current response
-    let currentToolsListEl = null;  // .turn-tools-list inside current turn
+    let currentTimelineEl = null;   // completed steps scroll up here
+    let currentLiveEl = null;       // sticky live writing near the input
+    let currentToolsListEl = null;  // .turn-tools-list inside timeline
     let currentToolsCountEl = null; // .turn-tools-summary counter
     let currentToolCount = 0;
     let toolCalls = {};
+    let activeToolCallId = null;
 
     // --- Resize handle ---
     let inputAreaHeight = 140;
@@ -1680,9 +2283,12 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       currentAssistantText = '';
       toolCalls = {};
       currentTurnEl = null;
+      currentTimelineEl = null;
+      currentLiveEl = null;
       currentToolsListEl = null;
       currentToolsCountEl = null;
       currentToolCount = 0;
+      activeToolCallId = null;
       currentThoughtEl = null;
       currentThoughtTextEl = null;
       currentThoughtText = '';
@@ -1780,18 +2386,15 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
 
     // --- Mode / Model pickers (cont.) ---
     function updateModePicker(modes) {
+      // Hermes edit-approval modes are driven by Agent/Ask/Plan — keep native picker hidden.
+      modePickerWrap.classList.add('hidden');
       if (!modes || !modes.availableModes || modes.availableModes.length === 0) {
-        modePickerWrap.classList.add('hidden');
         availableModes = [];
         currentModeId = null;
         return;
       }
       availableModes = modes.availableModes;
       currentModeId = modes.currentModeId || null;
-      modePickerWrap.classList.remove('hidden');
-      const current = availableModes.find(m => m.id === currentModeId);
-      modePickerLabel.textContent = current ? current.name : 'Mode';
-      modePickerLabel.title = current && current.description ? current.description : '';
       renderModeDropdown();
     }
 
@@ -2168,21 +2771,42 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
 
     function getStatusIcon(status) {
       switch (status) {
-        case 'running': return '⟳';
+        case 'running':
+        case 'in_progress':
+        case 'pending':
+          return '⟳';
         case 'completed': return '✓';
         case 'failed': return '✗';
         default: return '…';
       }
     }
 
-    // Ensure the current turn has a tools container
-    function ensureTurnTools() {
+    function isActiveToolStatus(status) {
+      return status === 'pending' || status === 'in_progress' || status === 'running';
+    }
+
+    function ensureTurn() {
       if (!currentTurnEl) {
-        // Create turn container if none (e.g., tool call before first text)
         currentTurnEl = document.createElement('div');
         currentTurnEl.className = 'turn';
         messagesEl.appendChild(currentTurnEl);
+        hideEmpty();
       }
+      if (!currentTimelineEl) {
+        currentTimelineEl = document.createElement('div');
+        currentTimelineEl.className = 'turn-timeline';
+        currentTurnEl.appendChild(currentTimelineEl);
+      }
+      if (!currentLiveEl) {
+        currentLiveEl = document.createElement('div');
+        currentLiveEl.className = 'turn-live';
+        currentTurnEl.appendChild(currentLiveEl);
+      }
+    }
+
+    // Timeline holds completed work; live holds sticky writing near the input.
+    function ensureTurnTools() {
+      ensureTurn();
       if (!currentToolsListEl) {
         const toolsWrap = document.createElement('div');
         toolsWrap.className = 'turn-tools';
@@ -2190,14 +2814,14 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
         currentToolCount = 0;
         const summary = document.createElement('div');
         summary.className = 'turn-tools-summary';
-        summary.textContent = '▸ Tool calls';
+        summary.textContent = '▾ Steps';
         currentToolsCountEl = summary;
         summary.addEventListener('click', () => {
           const list = summary.nextElementSibling;
           if (list) {
             const count = parseInt(summary.dataset.count || '0', 10);
             const collapsed = list.classList.toggle('collapsed');
-            summary.textContent = (collapsed ? '▸ ' : '▾ ') + count + ' tool call' + (count !== 1 ? 's' : '');
+            summary.textContent = (collapsed ? '▸ ' : '▾ ') + count + ' step' + (count !== 1 ? 's' : '');
           }
         });
         toolsWrap.appendChild(summary);
@@ -2207,8 +2831,184 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
         toolsWrap.appendChild(list);
         currentToolsListEl = list;
 
-        currentTurnEl.appendChild(toolsWrap);
+        currentTimelineEl.appendChild(toolsWrap);
       }
+    }
+
+    function appendTimelineItem(el) {
+      ensureTurnTools();
+      currentToolsListEl.appendChild(el);
+      if (currentToolsListEl) currentToolsListEl.classList.remove('collapsed');
+    }
+
+    function updateStepsSummary() {
+      if (!currentToolsCountEl) return;
+      currentToolsCountEl.dataset.count = String(currentToolCount);
+      const collapsed = currentToolsListEl && currentToolsListEl.classList.contains('collapsed');
+      currentToolsCountEl.textContent =
+        (collapsed ? '▸ ' : '▾ ') + currentToolCount + ' step' + (currentToolCount !== 1 ? 's' : '');
+    }
+
+    function setToolCompact(el, compact) {
+      if (!el) return;
+      if (compact) {
+        el.classList.add('is-compact');
+        el.classList.remove('is-active', 'is-open');
+      } else {
+        el.classList.remove('is-compact', 'is-open');
+        el.classList.add('is-active');
+      }
+    }
+
+    function collapseInactiveTools(exceptId) {
+      Object.keys(toolCalls).forEach(function(id) {
+        if (id === exceptId) return;
+        const el = toolCalls[id];
+        if (!el) return;
+        const icon = el.querySelector('.tc-icon');
+        const status = icon ? icon.className.replace('tc-icon', '').trim() : '';
+        if (!isActiveToolStatus(status)) {
+          setToolCompact(el, true);
+        }
+      });
+    }
+
+    function addDecisionRow(action, label, path) {
+      ensureTurn();
+      const row = document.createElement('div');
+      row.className = 'decision-row ' + (action === 'deny' ? 'deny' : 'allow');
+      const icon = action === 'deny' ? '✗' : '✓';
+      const pathHint = path ? (' · ' + path) : '';
+      row.innerHTML =
+        '<span>' + icon + '</span>' +
+        '<span class="decision-label">' + escapeHtml(label + pathHint) + '</span>';
+      if (currentToolsListEl) {
+        currentToolsListEl.appendChild(row);
+      } else if (currentTimelineEl) {
+        currentTimelineEl.appendChild(row);
+      } else {
+        ensureTurnTools();
+        currentToolsListEl.appendChild(row);
+      }
+      scrollToBottom();
+      return row;
+    }
+
+    function extractToolPath(tc) {
+      if (!tc) return '';
+      const raw = tc.rawInput || {};
+      if (typeof raw.path === 'string' && raw.path.trim()) return raw.path.trim();
+      if (typeof raw.file === 'string' && raw.file.trim()) return raw.file.trim();
+      if (typeof raw.file_path === 'string' && raw.file_path.trim()) return raw.file_path.trim();
+      if (Array.isArray(tc.locations)) {
+        for (const loc of tc.locations) {
+          if (loc && typeof loc.path === 'string' && loc.path.trim()) return loc.path.trim();
+        }
+      }
+      return '';
+    }
+
+    function isReadTool(tc, title) {
+      const kind = String((tc && tc.kind) || '').toLowerCase();
+      if (kind === 'read') return true;
+      const t = String(title || (tc && tc.title) || '').toLowerCase();
+      if (t.includes('read_file') || t.startsWith('read ') || t === 'read') return true;
+      // File read without shell command
+      if (extractToolPath(tc) && !(tc && tc.rawInput && (tc.rawInput.command || tc.rawInput.cmd))) {
+        if (kind === 'other' || kind === '') {
+          // Heuristic: title often contains the path for read tools
+          return /read|view|cat|open/.test(t);
+        }
+      }
+      return false;
+    }
+
+    function isEditTool(tc, title) {
+      const kind = String((tc && tc.kind) || '').toLowerCase();
+      if (kind === 'edit' || kind === 'write' || kind === 'delete') return true;
+      const t = String(title || (tc && tc.title) || '').toLowerCase();
+      if (/write_file|patch|edit|write |creat/.test(t)) return true;
+      if (Array.isArray(tc && tc.content)) {
+        if (tc.content.some(function(b) { return b && b.type === 'diff'; })) return true;
+      }
+      return false;
+    }
+
+    function formatReadTitle(path, title) {
+      if (path) {
+        const parts = path.replace(/\\\\/g, '/').split('/');
+        const leaf = parts[parts.length - 1] || path;
+        return 'Read ' + leaf;
+      }
+      const t = String(title || 'Read file');
+      return t.toLowerCase().startsWith('read') ? t : ('Read ' + t);
+    }
+
+    function formatEditTitle(path, title, kind) {
+      const parts = path ? path.replace(/\\\\/g, '/').split('/') : [];
+      const leaf = parts.length ? (parts[parts.length - 1] || path) : '';
+      const k = String(kind || '').toLowerCase();
+      if (leaf) {
+        if (k === 'write' || /write/.test(String(title || '').toLowerCase())) return 'Write ' + leaf;
+        if (k === 'delete') return 'Delete ' + leaf;
+        return 'Edit ' + leaf;
+      }
+      return title || 'Edit file';
+    }
+
+    function extractDiffBlocks(tc) {
+      const diffs = [];
+      if (!tc || !Array.isArray(tc.content)) return diffs;
+      for (const block of tc.content) {
+        if (block && block.type === 'diff') {
+          diffs.push({
+            path: block.path || '',
+            oldText: block.oldText != null ? String(block.oldText) : (block.old_text != null ? String(block.old_text) : null),
+            newText: block.newText != null ? String(block.newText) : (block.new_text != null ? String(block.new_text) : ''),
+          });
+        }
+      }
+      return diffs;
+    }
+
+    function renderDiffHtml(diff) {
+      if (!diff) return '';
+      const maxLines = 80;
+      const oldLines = diff.oldText != null ? diff.oldText.split('\\n') : null;
+      const newLines = String(diff.newText || '').split('\\n');
+      const parts = [];
+      if (diff.path) {
+        parts.push('<span class="diff-meta">--- ' + escapeHtml(diff.path) + '</span>');
+      }
+      if (oldLines == null) {
+        // New file / write — show additions
+        const slice = newLines.slice(0, maxLines);
+        for (const line of slice) {
+          parts.push('<span class="diff-add">+ ' + escapeHtml(line) + '</span>');
+        }
+        if (newLines.length > maxLines) {
+          parts.push('<span class="diff-meta">… +' + (newLines.length - maxLines) + ' more lines</span>');
+        }
+      } else {
+        // Compact line-oriented preview (not a full Myers diff)
+        const max = Math.max(oldLines.length, newLines.length);
+        let shown = 0;
+        for (let i = 0; i < max && shown < maxLines; i++) {
+          const o = oldLines[i];
+          const n = newLines[i];
+          if (o === n) {
+            if (o != null) parts.push('<span class="diff-meta">  ' + escapeHtml(o) + '</span>');
+          } else {
+            if (o != null) parts.push('<span class="diff-del">- ' + escapeHtml(o) + '</span>');
+            if (n != null) parts.push('<span class="diff-add">+ ' + escapeHtml(n) + '</span>');
+          }
+          shown++;
+        }
+        if (max > maxLines) {
+          parts.push('<span class="diff-meta">… +' + (max - maxLines) + ' more lines</span>');
+        }
+      }
+      return parts.join('\\n');
     }
 
     function formatToolDetails(tc) {
@@ -2228,8 +3028,9 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       if (Array.isArray(tc.content)) {
         for (const block of tc.content) {
           if (!block) continue;
-          if (block.type === 'diff' && block.path) {
-            lines.push('diff: ' + block.path);
+          if (block.type === 'diff') {
+            // Diffs render in a dedicated preview; skip dumping here.
+            continue;
           } else if (block.type === 'content' && block.content && block.content.type === 'text') {
             const t = String(block.content.text || '').trim();
             if (t) lines.push(t.length > 800 ? t.slice(0, 800) + '…' : t);
@@ -2256,34 +3057,110 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       addToolCallInline(toolCallId, title, status, extra);
     }
 
+    function wireToolActions(el, path, readTool) {
+      const toggleBtn = el.querySelector('.tc-toggle');
+      const openBtn = el.querySelector('.tc-open');
+      if (toggleBtn) {
+        toggleBtn.addEventListener('click', function() {
+          const expanded = el.classList.toggle('expanded');
+          toggleBtn.textContent = expanded
+            ? (readTool ? 'Hide content' : 'Hide diff')
+            : (readTool ? 'Show content' : 'Show diff');
+        });
+      }
+      if (openBtn && path) {
+        openBtn.addEventListener('click', function() {
+          vscode.postMessage({ type: 'openFilePreview', path: path });
+        });
+      }
+    }
+
+    function applyDiffPreview(el, extra) {
+      const diffs = extractDiffBlocks(extra);
+      let diffEl = el.querySelector('.tc-diff');
+      if (!diffs.length) {
+        if (diffEl) diffEl.remove();
+        return;
+      }
+      if (!diffEl) {
+        diffEl = document.createElement('pre');
+        diffEl.className = 'tc-diff';
+        const detailsEl = el.querySelector('.tc-details');
+        if (detailsEl) el.insertBefore(diffEl, detailsEl);
+        else el.appendChild(diffEl);
+      }
+      diffEl.innerHTML = diffs.map(renderDiffHtml).join('\\n\\n');
+    }
+
     function addToolCallInline(toolCallId, title, status, extra) {
       hideEmpty();
       ensureTurnTools();
-      // Keep tool list expanded so activity is always visible
-      if (currentToolsListEl) currentToolsListEl.classList.remove('collapsed');
+      collapseInactiveTools(toolCallId);
       currentToolCount++;
-      if (currentToolsCountEl) {
-        currentToolsCountEl.dataset.count = String(currentToolCount);
-        currentToolsCountEl.textContent = '▾ ' + currentToolCount + ' tool call' + (currentToolCount !== 1 ? 's' : '');
-      }
+      liveToolCount = currentToolCount;
+      updateStepsSummary();
 
       const details = formatToolDetails(extra);
       const kind = (extra && extra.kind) ? String(extra.kind) : '';
+      const path = extractToolPath(extra) || (extractDiffBlocks(extra)[0] && extractDiffBlocks(extra)[0].path) || '';
+      const readTool = isReadTool(extra, title);
+      const editTool = !readTool && isEditTool(extra, title);
+      const displayTitle = readTool
+        ? formatReadTitle(path, title)
+        : (editTool ? formatEditTitle(path, title, kind) : (title || 'Tool Call'));
       const el = document.createElement('div');
-      el.className = 'tool-call-inline';
+      el.className = 'tool-call-inline'
+        + (readTool ? ' is-read' : '')
+        + (editTool ? ' is-edit' : '');
       el.id = 'tc-' + toolCallId;
+      if (path) el.dataset.path = path;
+      el.dataset.title = displayTitle;
+
+      let actionsHtml = '';
+      if (readTool || editTool) {
+        actionsHtml =
+          '<div class="tc-actions">' +
+            (path ? '<button class="tc-action tc-open" type="button">Open preview</button>' : '') +
+            (readTool
+              ? '<button class="tc-action tc-toggle" type="button">Show content</button>'
+              : '') +
+          '</div>';
+      }
+
       el.innerHTML =
         '<div class="tc-row">' +
           '<span class="tc-icon ' + status + '">' + getStatusIcon(status) + '</span>' +
-          '<span class="tc-title">' + escapeHtml(title || 'Tool Call') + '</span>' +
-          (kind ? '<span class="tc-kind">' + escapeHtml(kind) + '</span>' : '') +
+          '<span class="tc-title">' + escapeHtml(displayTitle) + '</span>' +
+          (path ? '<span class="tc-kind">' + escapeHtml(path) + '</span>' : (kind ? '<span class="tc-kind">' + escapeHtml(kind) + '</span>' : '')) +
         '</div>' +
+        actionsHtml +
         '<pre class="tc-details">' + escapeHtml(details) + '</pre>';
-      currentToolsListEl.appendChild(el);
+
+      applyDiffPreview(el, extra);
+      wireToolActions(el, path, readTool);
+
+      // Click compact row to peek at details (keeps transcript concise by default).
+      el.addEventListener('click', function(e) {
+        if (!el.classList.contains('is-compact')) return;
+        if (e.target.closest('.tc-action')) return;
+        el.classList.toggle('is-open');
+      });
+
+      appendTimelineItem(el);
       toolCalls[toolCallId] = el;
-      setActivity((status === 'pending' || status === 'in_progress' || status === 'running')
-        ? ('Running: ' + (title || 'tool'))
-        : null);
+
+      if (isActiveToolStatus(status)) {
+        activeToolCallId = toolCallId;
+        setToolCompact(el, false);
+        if (readTool) setActivity('Reading ' + (path || 'file') + '…');
+        else if (editTool) setActivity((kind === 'write' ? 'Writing ' : 'Editing ') + (path || 'file') + '…');
+        else setActivity('Running: ' + (displayTitle || 'tool'));
+      } else {
+        setToolCompact(el, true);
+        activeToolCallId = null;
+        setActivity(null);
+      }
+      refreshStatsBar();
       scrollToBottom();
     }
 
@@ -2321,28 +3198,73 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       if (iconEl) {
         iconEl.className = 'tc-icon ' + status;
         iconEl.textContent = getStatusIcon(status);
-        if (title) {
+        const merged = Object.assign({}, extra || {});
+        const path = extractToolPath(merged) || el.dataset.path ||
+          ((extractDiffBlocks(merged)[0] && extractDiffBlocks(merged)[0].path) || '');
+        const readTool = isReadTool(merged, title || el.querySelector('.tc-title')?.textContent);
+        const editTool = !readTool && isEditTool(merged, title || el.querySelector('.tc-title')?.textContent);
+        if (title || editTool || readTool) {
           const titleEl = el.querySelector('.tc-title');
-          if (titleEl) titleEl.textContent = title;
+          if (titleEl) {
+            if (readTool) titleEl.textContent = formatReadTitle(path, title || titleEl.textContent);
+            else if (editTool) titleEl.textContent = formatEditTitle(path, title || titleEl.textContent, merged.kind);
+            else if (title) titleEl.textContent = title;
+          }
         }
         if (extra) {
           const detailsEl = el.querySelector('.tc-details');
-          const merged = Object.assign({}, extra);
           const text = formatToolDetails(merged);
           if (detailsEl && text) detailsEl.textContent = text;
-          if (extra.kind) {
+          if (path) el.dataset.path = path;
+          if (readTool) el.classList.add('is-read');
+          if (editTool) el.classList.add('is-edit');
+          applyDiffPreview(el, merged);
+          if ((readTool || editTool) && !el.querySelector('.tc-actions')) {
+            const actions = document.createElement('div');
+            actions.className = 'tc-actions';
+            if (path) {
+              const openBtn = document.createElement('button');
+              openBtn.className = 'tc-action tc-open';
+              openBtn.type = 'button';
+              openBtn.textContent = 'Open preview';
+              actions.appendChild(openBtn);
+            }
+            if (readTool) {
+              const toggleBtn = document.createElement('button');
+              toggleBtn.className = 'tc-action tc-toggle';
+              toggleBtn.type = 'button';
+              toggleBtn.textContent = el.classList.contains('expanded') ? 'Hide content' : 'Show content';
+              actions.appendChild(toggleBtn);
+            }
+            const row = el.querySelector('.tc-row');
+            if (row && row.nextSibling) el.insertBefore(actions, row.nextSibling);
+            else el.appendChild(actions);
+            wireToolActions(el, path, readTool);
+          } else if (merged.kind && !path) {
             let kindEl = el.querySelector('.tc-kind');
             if (!kindEl) {
               kindEl = document.createElement('span');
               kindEl.className = 'tc-kind';
               el.querySelector('.tc-row')?.appendChild(kindEl);
             }
-            kindEl.textContent = extra.kind;
+            kindEl.textContent = merged.kind;
           }
         }
-        setActivity((status === 'pending' || status === 'in_progress' || status === 'running')
-          ? ('Running: ' + (title || el.querySelector('.tc-title')?.textContent || 'tool'))
-          : null);
+        if (isActiveToolStatus(status)) {
+          activeToolCallId = toolCallId;
+          collapseInactiveTools(toolCallId);
+          setToolCompact(el, false);
+          const label = el.querySelector('.tc-title')?.textContent || title || 'tool';
+          if (readTool) setActivity('Reading ' + (path || 'file') + '…');
+          else if (editTool) setActivity('Editing ' + (path || 'file') + '…');
+          else setActivity('Running: ' + label);
+        } else {
+          setToolCompact(el, true);
+          if (activeToolCallId === toolCallId) activeToolCallId = null;
+          activityFallback = 'Thinking…';
+          setActivity(null);
+        }
+        scrollToBottom();
         return;
       }
       const badge = el.querySelector('.status-badge');
@@ -2358,19 +3280,23 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
 
     function showPermissionCard(request) {
       hideEmpty();
+      ensureTurn();
       setActivity('Waiting for your approval…', true);
       const card = document.createElement('div');
       card.className = 'permission-card';
       card.id = 'perm-' + request.requestId;
       card.dataset.requestId = request.requestId;
+      card.dataset.accessKind = request.accessKind || '';
+      card.dataset.path = (request.paths && request.paths[0]) || '';
+      card.dataset.title = request.title || request.accessSummary || 'permission';
 
       const chips = [];
       if (request.accessKind) chips.push('<span class="perm-chip">' + escapeHtml(request.accessKind) + '</span>');
-      (request.paths || []).slice(0, 4).forEach(function(p) {
+      (request.paths || []).slice(0, 2).forEach(function(p) {
         chips.push('<span class="perm-chip">' + escapeHtml(p) + '</span>');
       });
 
-      const detailText = (request.details || []).join('\\n');
+      const detailText = (request.details || []).slice(0, 6).join('\\n');
       const buttons = (request.options || []).map(function(opt) {
         return '<button class="perm-btn ' + escapeHtml(opt.style || 'allow') + '" data-option-id="' + escapeHtml(opt.optionId) + '">' +
           '<span class="perm-btn-label">' + escapeHtml(opt.label) + '</span>' +
@@ -2379,9 +3305,9 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       }).join('');
 
       card.innerHTML =
-        '<div class="perm-eyebrow">Approval required</div>' +
-        '<div class="perm-title">' + escapeHtml(request.title || 'Agent wants to continue') + '</div>' +
-        '<div class="perm-summary">' + escapeHtml(request.accessSummary || 'Hermes is requesting permission to run a tool.') + '</div>' +
+        '<div class="perm-eyebrow">Approval needed</div>' +
+        '<div class="perm-title">' + escapeHtml(request.title || 'Continue?') + '</div>' +
+        '<div class="perm-summary">' + escapeHtml(request.accessSummary || 'Hermes needs permission.') + '</div>' +
         (chips.length ? '<div class="perm-meta">' + chips.join('') + '</div>' : '') +
         (detailText ? '<pre class="perm-details">' + escapeHtml(detailText) + '</pre>' : '') +
         '<div class="perm-actions">' + buttons + '</div>';
@@ -2394,19 +3320,22 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
         });
       });
 
-      messagesEl.appendChild(card);
+      // Keep the decision near the input while waiting; minimize after choose.
+      currentLiveEl.appendChild(card);
       scrollToBottom();
     }
 
     function resolvePermissionCard(card, optionId, label) {
+      if (!card || card.classList.contains('resolved')) return;
       card.classList.add('resolved');
-      card.querySelectorAll('.perm-btn').forEach(function(b) { b.disabled = true; });
-      const result = document.createElement('div');
-      result.className = 'perm-result';
-      result.textContent = optionId
-        ? ('You chose: ' + (label || optionId))
-        : 'Request expired / cancelled (denied)';
-      card.appendChild(result);
+      const denied = !optionId || /reject|deny|cancel/i.test(String(label || optionId));
+      const kind = card.dataset.accessKind || 'action';
+      const path = card.dataset.path || '';
+      const short = optionId
+        ? ((denied ? 'Rejected' : 'Allowed') + ' ' + kind + (label ? (': ' + label) : ''))
+        : 'Denied / expired';
+      addDecisionRow(denied ? 'deny' : 'allow', short, path);
+      card.remove();
       setActivity(null);
       vscode.postMessage({
         type: 'permissionResponse',
@@ -2461,6 +3390,11 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           ? 'Thought for ' + elapsed + 's'
           : 'Thought';
       }
+      // Collapse thought into the timeline so writing stays near the input.
+      currentThoughtEl.open = false;
+      if (currentTimelineEl && currentThoughtEl.parentElement === currentLiveEl) {
+        currentTimelineEl.appendChild(currentThoughtEl);
+      }
     }
 
     /**
@@ -2483,12 +3417,17 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
         chatHistory.push({ kind: 'message', role: 'assistant', text: currentAssistantText });
         saveState();
       }
+      collapseInactiveTools(null);
+      if (currentAssistantEl) currentAssistantEl.classList.remove('streaming-cursor');
       currentAssistantEl = null;
       currentAssistantText = '';
       currentTurnEl = null;
+      currentTimelineEl = null;
+      currentLiveEl = null;
       currentToolsListEl = null;
       currentToolsCountEl = null;
       currentToolCount = 0;
+      activeToolCallId = null;
       currentThoughtEl = null;
       currentThoughtTextEl = null;
       currentThoughtText = '';
@@ -2563,6 +3502,9 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       const msg = event.data;
       switch (msg.type) {
         case 'state':
+          if (msg.interactionMode) {
+            setInteractionModeUi(msg.interactionMode);
+          }
           if (msg.session) {
             showSessionConnected(msg.session);
           } else {
@@ -2570,20 +3512,51 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           }
           break;
 
+        case 'interactionModeUpdate':
+          setInteractionModeUi(msg.modeId || 'agent');
+          break;
+
+        case 'autoPermission': {
+          const notice = msg.notice || {};
+          hideEmpty();
+          const path = (notice.paths && notice.paths[0]) || '';
+          const label = (notice.action === 'deny' ? 'Blocked' : 'Auto-allowed')
+            + ' ' + (notice.accessKind || 'action')
+            + (notice.title ? (': ' + notice.title) : '');
+          addDecisionRow(notice.action === 'deny' ? 'deny' : 'allow', label, path);
+          setActivity(
+            notice.action === 'deny'
+              ? ('Blocked ' + (notice.accessKind || 'action'))
+              : ('Auto-allowed ' + (notice.accessKind || 'edit') + '…'),
+          );
+          break;
+        }
+
         case 'promptStart':
           setProcessing(true);
+          turnStartMs = Date.now();
+          streamedOutChars = 0;
+          liveToolCount = 0;
+          lastUsage = null;
+          activityFallback = 'Thinking…';
+          startStatsTimer();
           setActivity('Hermes is working…');
           currentAssistantEl = null;
           currentAssistantText = '';
           currentTurnEl = null;
+          currentTimelineEl = null;
+          currentLiveEl = null;
           currentToolsListEl = null;
           currentToolsCountEl = null;
           currentToolCount = 0;
+          activeToolCallId = null;
+          toolCalls = {};
           currentThoughtEl = null;
           currentThoughtTextEl = null;
           currentThoughtText = '';
           thoughtStartTime = null;
           thoughtEndTime = null;
+          refreshStatsBar();
           break;
 
         case 'promptEnd':
@@ -2602,28 +3575,36 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
             saveState();
             // Request markdown rendering from extension host
             if (currentAssistantEl) {
+              currentAssistantEl.classList.remove('streaming-cursor');
               vscode.postMessage({
                 type: 'renderMarkdown',
                 items: [{ index: chatHistory.length - 1, text: currentAssistantText }]
               });
             }
           }
+          if (msg.usage) {
+            lastUsage = {
+              inputTokens: msg.usage.inputTokens ?? msg.usage.input_tokens ?? null,
+              outputTokens: msg.usage.outputTokens ?? msg.usage.output_tokens ?? null,
+              totalTokens: msg.usage.totalTokens ?? msg.usage.total_tokens ?? null,
+              thoughtTokens: msg.usage.thoughtTokens ?? msg.usage.thought_tokens ?? null,
+            };
+          }
           setProcessing(false);
+          stopStatsTimer();
           setActivity(null);
+          collapseInactiveTools(null);
+          if (currentAssistantEl) currentAssistantEl.classList.remove('streaming-cursor');
           currentAssistantEl = null;
           currentAssistantText = '';
-          // Keep tool activity expanded so the transcript stays fully visible
-          if (currentToolsListEl) {
-            currentToolsListEl.classList.remove('collapsed');
-            if (currentToolsCountEl) {
-              currentToolsCountEl.dataset.count = String(currentToolCount);
-              currentToolsCountEl.textContent = '▾ ' + currentToolCount + ' tool call' + (currentToolCount !== 1 ? 's' : '');
-            }
-          }
+          updateStepsSummary();
           currentTurnEl = null;
+          currentTimelineEl = null;
+          currentLiveEl = null;
           currentToolsListEl = null;
           currentToolsCountEl = null;
           currentToolCount = 0;
+          activeToolCallId = null;
           currentThoughtEl = null;
           currentThoughtTextEl = null;
           currentThoughtText = '';
@@ -2653,9 +3634,12 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           currentAssistantText = '';
           toolCalls = {};
           currentTurnEl = null;
+          currentTimelineEl = null;
+          currentLiveEl = null;
           currentToolsListEl = null;
           currentToolsCountEl = null;
           currentToolCount = 0;
+          activeToolCallId = null;
           currentThoughtEl = null;
           currentThoughtTextEl = null;
           currentThoughtText = '';
@@ -2744,6 +3728,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           const content = update.content;
           if (content && content.type === 'text' && content.text) {
             currentAssistantText += content.text;
+            noteStreamChars(content.text);
             // Don't create visible element until there's non-whitespace content
             if (!currentAssistantEl && !currentAssistantText.trim()) {
               break;
@@ -2754,18 +3739,15 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
               currentThoughtEl.open = false;
             }
             if (!currentAssistantEl) {
-              // Create a turn container, assistant text goes inside it
-              if (!currentTurnEl) {
-                currentTurnEl = document.createElement('div');
-                currentTurnEl.className = 'turn';
-                messagesEl.appendChild(currentTurnEl);
-                hideEmpty();
-              }
+              ensureTurn();
               currentAssistantEl = document.createElement('div');
-              currentAssistantEl.className = 'message assistant';
-              currentTurnEl.insertBefore(currentAssistantEl, currentTurnEl.querySelector('.turn-tools'));
+              currentAssistantEl.className = 'message assistant streaming-cursor';
+              // Live writing stays in the sticky dock near the input.
+              currentLiveEl.appendChild(currentAssistantEl);
             }
             currentAssistantEl.textContent = currentAssistantText;
+            activityFallback = 'Writing response…';
+            setActivity('Writing response…');
             scrollToBottom();
           }
           break;
@@ -2797,13 +3779,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           const content = update.content;
           if (content && content.type === 'text') {
             if (!currentThoughtEl) {
-              // Create thought block inside turn
-              if (!currentTurnEl) {
-                currentTurnEl = document.createElement('div');
-                currentTurnEl.className = 'turn';
-                messagesEl.appendChild(currentTurnEl);
-                hideEmpty();
-              }
+              ensureTurn();
               currentThoughtEl = document.createElement('details');
               currentThoughtEl.className = 'thought-block streaming';
               currentThoughtEl.open = true;
@@ -2811,12 +3787,16 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
                 '<summary><span class="thought-indicator"></span> Thinking\u2026</summary>' +
                 '<div class="thought-content"></div>';
               currentThoughtTextEl = currentThoughtEl.querySelector('.thought-content');
-              currentTurnEl.insertBefore(currentThoughtEl, currentTurnEl.firstChild);
+              // Thought starts in live dock; collapses into timeline when done.
+              currentLiveEl.insertBefore(currentThoughtEl, currentLiveEl.firstChild);
               thoughtStartTime = Date.now();
               currentThoughtText = '';
             }
             currentThoughtText += content.text;
+            noteStreamChars(content.text);
             currentThoughtTextEl.textContent = currentThoughtText;
+            activityFallback = 'Thinking…';
+            setActivity('Thinking…');
             scrollToBottom();
           }
           break;
@@ -2869,6 +3849,13 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           availableCommands = update.availableCommands || [];
           updatePlaceholder();
           break;
+
+        case 'usage_update': {
+          if (typeof update.used === 'number') contextUsed = update.used;
+          if (typeof update.size === 'number') contextSize = update.size;
+          refreshStatsBar();
+          break;
+        }
       }
     }
 
@@ -2894,6 +3881,17 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       });
       this.view.show?.(true);
     }
+  }
+
+  /**
+   * Surface silent Agent/Ask/Plan permission decisions in the chat transcript.
+   */
+  notifyAutoPermission(notice: AutoPermissionNotice): void {
+    this._hasChatContent = true;
+    this.postMessage({
+      type: 'autoPermission',
+      notice,
+    });
   }
 
   /**

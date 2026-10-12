@@ -1,8 +1,8 @@
 {
   "name": "hermes-ide",
   "displayName": "Hermes Local IDE",
-  "description": "Local VS Code chat for Hermes via ACP (v0.2: live tool activity + Cursor-like approval cards).",
-  "version": "0.2.0",
+  "description": "Local VS Code chat for Hermes via ACP (syntax-highlighted code, collapsed reads + file preview).",
+  "version": "0.2.4",
   "publisher": "hermes-ide",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -284,13 +284,23 @@
             }
           }
         },
+        "acp.defaultInteractionMode": {
+          "type": "string",
+          "enum": [
+            "agent",
+            "ask",
+            "plan"
+          ],
+          "default": "agent",
+          "description": "Default chat mode: Agent (edits allowed by default), Ask (Q&A only), or Plan (plan only, no edits)."
+        },
         "acp.autoApprovePermissions": {
           "type": "string",
           "enum": [
             "ask"
           ],
           "default": "ask",
-          "description": "Only ask is supported; auto-approve is disabled."
+          "description": "Legacy setting. Prefer Agent/Ask/Plan in the chat toolbar. Shell and network still prompt."
         },
         "acp.defaultWorkingDirectory": {
           "type": "string",
@@ -318,6 +328,7 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.21.1",
+    "highlight.js": "^11.11.1",
     "marked": "^15.0.0",
     "zod": "^3.25.0"
   },
@@ -330,12 +341,12 @@
     "@vscode/test-cli": "^0.0.10",
     "@vscode/test-electron": "^2.4.1",
     "@vscode/vsce": "^3.7.1",
+    "esbuild": "^0.25.0",
     "eslint": "^9.0.0",
     "ts-loader": "^9.5.0",
     "typescript": "^5.5.0",
     "typescript-eslint": "^8.0.0",
     "webpack": "^5.95.0",
-    "webpack-cli": "^5.1.0",
-    "esbuild": "^0.25.0"
+    "webpack-cli": "^5.1.0"
   }
 }

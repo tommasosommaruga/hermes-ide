@@ -3,10 +3,27 @@ import type {
   RequestPermissionRequest,
   RequestPermissionResponse,
 } from '@agentclientprotocol/sdk';
+import {
+  permissionAutoAction,
+  pickAllowOptionId,
+  pickDenyOptionId,
+  type InteractionModeId,
+} from '../core/InteractionMode';
 
 export type PermissionUiPrompt = (
   request: PermissionUiRequest,
 ) => Promise<RequestPermissionResponse>;
+
+export type InteractionModeProvider = () => InteractionModeId;
+
+export type AutoPermissionNotice = {
+  action: 'allow' | 'deny';
+  accessKind: string;
+  title: string;
+  paths: string[];
+};
+
+export type AutoPermissionListener = (notice: AutoPermissionNotice) => void;
 
 interface AgentPermissionOption {
   optionId: string;
@@ -214,18 +231,55 @@ export function buildPermissionUiRequest(params: RequestPermissionRequest): Perm
 
 /**
  * Handles ACP permission requests. Prefer in-chat UI when wired;
- * otherwise fail closed (deny).
+ * otherwise fail closed (deny). Interaction mode can auto-allow edits
+ * (Agent) or auto-deny edits (Ask / Plan).
  */
 export class PermissionHandler {
   private uiPrompt?: PermissionUiPrompt;
+  private modeProvider?: InteractionModeProvider;
+  private autoListener?: AutoPermissionListener;
 
   setUiPrompt(prompt: PermissionUiPrompt | undefined): void {
     this.uiPrompt = prompt;
   }
 
+  setInteractionModeProvider(provider: InteractionModeProvider | undefined): void {
+    this.modeProvider = provider;
+  }
+
+  setAutoPermissionListener(listener: AutoPermissionListener | undefined): void {
+    this.autoListener = listener;
+  }
+
   async requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
     const uiRequest = buildPermissionUiRequest(params);
-    log(`requestPermission: ${uiRequest.title} (${uiRequest.accessKind})`);
+    const mode = this.modeProvider?.() ?? 'agent';
+    const auto = permissionAutoAction(mode, uiRequest.accessKind);
+    log(`requestPermission: ${uiRequest.title} (${uiRequest.accessKind}) mode=${mode} auto=${auto}`);
+
+    if (auto === 'allow') {
+      const optionId = pickAllowOptionId(params.options || []);
+      if (optionId) {
+        log(`Auto-allowing ${uiRequest.accessKind} via ${optionId}`);
+        this.autoListener?.({
+          action: 'allow',
+          accessKind: uiRequest.accessKind,
+          title: uiRequest.title,
+          paths: uiRequest.paths,
+        });
+        return { outcome: { outcome: 'selected', optionId } };
+      }
+      log('Auto-allow requested but no allow option — falling through to UI');
+    } else if (auto === 'deny') {
+      log(`Auto-denying ${uiRequest.accessKind} in ${mode} mode`);
+      this.autoListener?.({
+        action: 'deny',
+        accessKind: uiRequest.accessKind,
+        title: uiRequest.title,
+        paths: uiRequest.paths,
+      });
+      return this.deny(params);
+    }
 
     if (!this.uiPrompt) {
       log('No permission UI wired — denying');
@@ -257,11 +311,9 @@ export class PermissionHandler {
   }
 
   private deny(params: RequestPermissionRequest): RequestPermissionResponse {
-    const denyOption = params.options.find(
-      (o) => o.optionId === 'deny' || o.kind.startsWith('reject'),
-    );
-    if (denyOption) {
-      return { outcome: { outcome: 'selected', optionId: denyOption.optionId } };
+    const denyOptionId = pickDenyOptionId(params.options || []);
+    if (denyOptionId) {
+      return { outcome: { outcome: 'selected', optionId: denyOptionId } };
     }
     return { outcome: { outcome: 'cancelled' } };
   }

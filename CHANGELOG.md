@@ -4,6 +4,36 @@ All notable changes to the "vscode-acp" extension will be documented in this fil
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.2.4] - 2026-10-12
+
+### Changed
+- Chat transcript now matches typical agent UIs: **completed steps scroll up**, **live writing stays sticky near the input**.
+- Completed tool calls collapse to one-line steps (click to expand); edits stay ordered in a timeline.
+- Approval decisions minimize to a compact ✓/✗ row after you choose (or auto-allow/deny).
+
+## [0.2.3] - 2026-10-12
+
+### Added
+- **Live stats strip** in chat: elapsed time, estimated tok/s, in/out tokens, context window usage, tool count — no external status browser needed.
+- **Live edit/write previews**: patch/write tool calls show a diff preview in chat as Hermes works.
+- **Auto-allow/deny chips** when Agent/Ask/Plan silently answers a permission prompt.
+- Continuous activity line stays on between tools (`Thinking…` / `Writing response…`) so long turns are not blank.
+
+### Changed
+- Tool status treats ACP `in_progress` like running; streaming assistant text shows a cursor while generating.
+
+## [0.2.2] - 2026-10-12
+
+### Added
+- **Agent / Ask / Plan** chat modes (Cursor-like) in the composer toolbar.
+  - **Agent** (default): maps to Hermes `accept_edits`; code edits/writes are auto-allowed; shell and network still prompt.
+  - **Ask**: Q&A only — file edits are auto-denied; soft prompt prefix tells Hermes not to modify files.
+  - **Plan**: plan-only — same edit denial as Ask, with a plan-oriented prompt prefix.
+- Setting `acp.defaultInteractionMode` (`agent` | `ask` | `plan`, default `agent`).
+
+### Changed
+- Hermes native Default / Accept Edits / Don't Ask picker is hidden; Agent/Ask/Plan drives Hermes session mode instead.
+
 ## [0.2.0] - 2026-05-16
 
 ### Added

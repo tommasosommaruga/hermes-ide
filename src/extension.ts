@@ -50,7 +50,12 @@ export function activate(context: vscode.ExtensionContext): void {
     sessionUpdateHandler,
   );
   // Route Hermes permission requests into the chat panel (Cursor-like cards).
+  // Agent mode auto-allows edits; Ask/Plan auto-deny file mutations.
   permissionHandler.setUiPrompt((req) => chatWebviewProvider.promptPermission(req));
+  permissionHandler.setInteractionModeProvider(() => chatWebviewProvider.getInteractionMode());
+  permissionHandler.setAutoPermissionListener((notice) => {
+    chatWebviewProvider.notifyAutoPermission(notice);
+  });
   const chatViewRegistration = vscode.window.registerWebviewViewProvider(
     ChatWebviewProvider.viewType,
     chatWebviewProvider,

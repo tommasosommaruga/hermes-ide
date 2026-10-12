@@ -11,7 +11,11 @@ Adapted fork of [formulahendry/vscode-acp](https://github.com/formulahendry/vsco
 - No remote agent registry
 - No npx / `@latest` launchers
 - Direct spawn with `shell: false`
-- **v0.2:** live tool activity in chat (commands, paths, status) + Cursor-like in-chat approval cards with Allow once / Allow for session / Allow always / Reject
+- **v0.2:** live tool activity in chat + Cursor-like approval cards
+- **v0.2.1:** syntax-highlighted code fences (Python/JS/TS/…), markdown rendering, collapsed file reads with **Open preview**
+- **v0.2.2:** Agent / Ask / Plan modes; Agent (default) auto-allows code edits; Ask/Plan block file mutations; shell still prompts
+- **v0.2.3:** live stats (tok/s, tokens, context), edit diffs in chat, continuous activity while Hermes works
+- **v0.2.4:** sticky live reply near input; completed steps scroll up compact; decisions minimize
 - Client fs/terminal capabilities not advertised
 - Traffic logging off by default
 
