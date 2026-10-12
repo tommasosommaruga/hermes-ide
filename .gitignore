@@ -1,0 +1,10 @@
+node_modules/
+dist/
+dist-test/
+out/
+*.vsix
+*.log
+.DS_Store
+.vscode-test/
+*.bak*
+README.md.bak-upstream
